@@ -7,14 +7,17 @@ import os
 import json
 import pdb
 
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
+from safetensors.torch import load_file
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.modeling_utils import ModelMixin
+from diffusers import ModelMixin
 from diffusers.utils import BaseOutput, logging
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.loaders import PeftAdapterMixin, UNet2DConditionLoadersMixin
 from .unet_blocks import (
     CrossAttnDownBlock3D,
     CrossAttnUpBlock3D,
@@ -25,6 +28,7 @@ from .unet_blocks import (
     get_up_block,
 )
 from .resnet import InflatedConv3d, InflatedGroupNorm
+from peft import LoraConfig
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -35,7 +39,7 @@ class UNet3DConditionOutput(BaseOutput):
     sample: torch.FloatTensor
 
 
-class UNet3DConditionModel(ModelMixin, ConfigMixin):
+class UNet3DConditionModel(ModelMixin, ConfigMixin, PeftAdapterMixin, UNet2DConditionLoadersMixin):
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -330,6 +334,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         mid_block_additional_residual: Optional[torch.Tensor] = None,
 
         return_dict: bool = True,
+
+        smooth_alpha: float = 0.0, # 0 for do not use smooth [0, 1)
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         Args:
@@ -475,7 +481,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         return UNet3DConditionOutput(sample=sample)
 
     @classmethod
-    def from_pretrained_2d(cls, pretrained_model_path, subfolder=None, unet_additional_kwargs=None):
+    def from_pretrained_2d(cls, pretrained_model_path, motion_module_path=None, subfolder=None, unet_additional_kwargs=None, rank=0, pre_trained_2d_unet_path=None, return_missing_keys=False, mm_zero_proj_out=False):
         if subfolder is not None:
             pretrained_model_path = os.path.join(pretrained_model_path, subfolder)
         print(f"loaded 3D unet's pretrained weights from {pretrained_model_path} ...")
@@ -499,17 +505,71 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             "CrossAttnUpBlock3D"
         ]
 
+        # pattern = r'^(?=.*(?:to_k|to_q|to_v|to_out\.0))(?!.*motion_modules).*$'
+        if pre_trained_2d_unet_path is not None:
+            pattern = r'^(?=.*(?:to_k|to_q|to_v|to_out\.0))(?!.*(?:motion_modules|attn_temp)).*$'
+            unet_lora_config = LoraConfig(
+                r=rank,
+                lora_alpha=rank,
+                init_lora_weights="gaussian",
+                target_modules=pattern
+            )
+
         from diffusers.utils import WEIGHTS_NAME
         model = cls.from_config(config, **unet_additional_kwargs)
-        model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
+        if pre_trained_2d_unet_path is not None:
+            model.add_adapter(unet_lora_config)
+
+        if pre_trained_2d_unet_path is not None:
+            model_file = pre_trained_2d_unet_path
+        else:
+            model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
         if not os.path.isfile(model_file):
             raise RuntimeError(f"{model_file} does not exist")
         state_dict = torch.load(model_file, map_location="cpu")
+        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
 
-        m, u = model.load_state_dict(state_dict, strict=False)
+        if pre_trained_2d_unet_path is not None:
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                tmp_split = key.split(".")
+                new_key = ".".join(tmp_split[1:])
+                new_state_dict[new_key] = value
+        else:
+            new_state_dict = state_dict
+
+        # new_state_dict = state_dict
+
+        # load the motion module weights
+        if motion_module_path is not None:
+            if motion_module_path.split('.')[-1].lower() in ["pth", "pt", "ckpt"]:
+                logger.info(f"Load motion module params from {motion_module_path}")
+                motion_state_dict = torch.load(
+                    motion_module_path, map_location="cpu", weights_only=True
+                )
+            elif motion_module_path.split('.')[-1].lower() == "safetensors":
+                motion_state_dict = load_file(motion_module_path, device="cpu")
+            else:
+                raise RuntimeError(
+                    f"unknown file format for motion module weights: {motion_module_path.split('.')[-1]}"
+                )
+            if mm_zero_proj_out:
+                logger.info(f"Zero initialize proj_out layers in motion module...")
+                new_motion_state_dict = OrderedDict()
+                for k in motion_state_dict:
+                    if "proj_out" in k:
+                        continue
+                    new_motion_state_dict[k] = motion_state_dict[k]
+                motion_state_dict = new_motion_state_dict
+
+            new_state_dict.update(motion_state_dict)
+
+        m, u = model.load_state_dict(new_state_dict, strict=False)
         print(f"### missing keys: {len(m)}; \n### unexpected keys: {len(u)};")
         
         params = [p.numel() if "motion_modules." in n else 0 for n, p in model.named_parameters()]
         print(f"### Motion Module Parameters: {sum(params) / 1e6} M")
         
+        if return_missing_keys:
+            return model, m
         return model

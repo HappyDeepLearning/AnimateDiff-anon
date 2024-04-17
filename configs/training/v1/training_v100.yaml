@@ -1,4 +1,4 @@
-is_v100: false
+is_v100: True
 
 image_finetune: false
 
@@ -25,16 +25,16 @@ noise_scheduler_kwargs:
   num_train_timesteps: 1000
   beta_start:          0.00085
   beta_end:            0.012
-  beta_schedule:       "linear" # `linear`, `scaled_linear`, or `squaredcos_cap_v2`
+  beta_schedule:       "linear"
   steps_offset:        1
-  clip_sample:         False
+  clip_sample:         false
 
 train_data:
-  rgb_root: dataset/train_data/GaitLU_pkl/train/org
-  pose_root: dataset/train_data/GaitLU_pkl/train/pose
-  sil_root: dataset/train_data/GaitLU_pkl/train/sil
+  rgb_root: dataset/GaitLU_img/train/org
+  pose_root: dataset/GaitLU_img/train/pose
+  sil_root: dataset/GaitLU_img/train/sil
   sample_size: 256
-  frame_number: 16
+  frame_number: 8
   interval: 4
   text_prompts:
     - "passerby"
@@ -50,11 +50,12 @@ train_data:
 validation_data:
   prompts:
     - "person with thinness and high height, best quality, realistic"
-  mask_path: dataset/train_data/GaitLU_pkl/test/sil/Delhi/000051.pkl
-  image_path: dataset/train_data/GaitLU_pkl/test/org/Delhi/000051.pkl
+  mask_path: dataset/GaitLU_img/test/sil/Delhi/000051
+  image_path: dataset/GaitLU_img/test/org/Delhi/000051
   num_inference_steps: 25
   guidance_scale: 8.
   deliate_mask: False
+  context_overlap: 4
 
 trainable_modules:
   - "motion_modules."
@@ -80,7 +81,7 @@ is_debug: False
 
 rank: 4
 
-pre_trained_2d_unet_path: "outputs/cse_output/v100/stage1/checkpoint-epoch-49.ckpt"
+pre_trained_2d_unet_path: "outputs/cse_logs/stage1_lora/checkpoint-epoch-48.ckpt"
 
 inference_frame_number: 32
 motion_module_path: huggingface_models/v3_sd15_mm.ckpt

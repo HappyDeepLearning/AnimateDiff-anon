@@ -1,0 +1,77 @@
+is_v100: false
+
+image_finetune: true
+
+output_dir: "outputs"
+pretrained_model_path: "huggingface_models/runwayml/stable-diffusion-v1-5"
+
+noise_scheduler_kwargs:
+  num_train_timesteps: 1000
+  beta_start:          0.00085
+  beta_end:            0.012
+  beta_schedule:       "linear" # linear, scaled_linear, or squaredcos_cap_v2
+  steps_offset:        1
+  clip_sample:         false
+
+train_data:
+  # data_root: dataset/train_data/GaitLU_img # 4GPUs
+  data_root: dataset/GaitLU_img # A100
+  is_train: true
+  train_test_ratio: 0.85
+  sample_size: 256 # <------------------------这里更改分辨率
+  text_prompts:
+    prob_each_parts: [0.3, 0.2, 1.0, 0.5, 0.1]
+    base_text:
+      - "an image of"
+      - "an image of a"
+      - "a"
+    adj_text:
+      - "realistic"
+      - "natural"
+      - "high quality"
+    n_text:
+      - "person"
+      - "pedestrian"
+      - "passerby"
+      - "human"
+    v_text:
+      - "is walking"
+      - "is runing"
+      - "is strolling"
+      - "is moving"
+    adv_text:
+      - "on the street"
+      - "along the sidewalk"
+
+    
+
+validation_data:
+  prompts:
+    - "(person, full body), best quality, highres"
+  # mask_path: dataset/train_data/GaitLU_pkl/test/sil/Delhi/000051.pkl
+  # image_path: dataset/train_data/GaitLU_pkl/test/org/Delhi/000051.pkl
+  image_path: dataset/GaitLU_img/test/org/Delhi/000051 # A100
+  mask_path: dataset/GaitLU_img/test/sil/Delhi/000051 # A100
+  num_inference_steps: 25
+  guidance_scale: 8.
+
+trainable_modules: null
+
+unet_checkpoint_path: "outputs/stage1_image_finetune_inpaint-2024-04-15T23-32-07/checkpoints/checkpoint-epoch-2.ckpt"
+
+learning_rate:    1.e-5
+train_batch_size: 32 # <------------------------这里更改batch size
+
+max_train_epoch:      5 # <------------------------这里更改训练的epoch数
+max_train_steps:      -1
+checkpointing_epochs: 1 # <------------------------这里更改checkpoint的epoch数
+checkpointing_steps:  -1
+
+validation_steps:       500
+validation_steps_tuple: [2, 500]
+
+global_seed: 347
+mixed_precision_training: True
+enable_xformers_memory_efficient_attention: True
+
+is_debug: False

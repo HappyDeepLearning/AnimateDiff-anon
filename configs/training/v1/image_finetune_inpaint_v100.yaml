@@ -1,4 +1,4 @@
-is_v100: false
+is_v100: true
 
 image_finetune: true
 
@@ -14,9 +14,9 @@ noise_scheduler_kwargs:
   clip_sample:         false
 
 train_data:
-  rgb_root: dataset/train_data/GaitLU_pkl/train/org
-  pose_root: dataset/train_data/GaitLU_pkl/train/pose
-  sil_root: dataset/train_data/GaitLU_pkl/train/sil
+  rgb_root: dataset/train_data/rgb
+  pose_root: dataset/train_data/pose
+  sil_root: dataset/train_data/sil
   sample_size: 256
   text_prompts:
     - "passerby"
@@ -33,6 +33,8 @@ train_data:
 validation_data:
   prompts:
     - "(person, full body), best quality, highres"
+  mask_path: dataset/train_data/val_data/KualaLumpur/_K5E6dPujFU/152967/sil/rgb
+  image_path: dataset/train_data/val_data/KualaLumpur/_K5E6dPujFU/152967/rgb
   num_inference_steps: 25
   guidance_scale: 8.
 
@@ -44,12 +46,12 @@ unet_checkpoint_path: ""
 learning_rate:    1.e-5
 train_batch_size: 4
 
-max_train_epoch:      -1
-max_train_steps:      10
+max_train_epoch:      20
+max_train_steps:      -1
 checkpointing_epochs: -1
-checkpointing_steps:  5
+checkpointing_steps:  5000
 
-validation_steps:       5
+validation_steps:       500
 validation_steps_tuple: [2, 500]
 
 global_seed: 347

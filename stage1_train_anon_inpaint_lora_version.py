@@ -9,7 +9,9 @@ import datetime
 import subprocess
 
 from pathlib import Path
+# import bitsandbytes as bnb
 from tqdm.auto import tqdm
+
 from einops import rearrange
 from omegaconf import OmegaConf
 from safetensors import safe_open
@@ -23,10 +25,15 @@ from torch.optim.swa_utils import AveragedModel
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# import diffusers
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict
+
+import bitsandbytes as bnb
+
+import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.models import UNet2DConditionModel
-from diffusers.pipelines import StableDiffusionPipeline
+from diffusers.pipelines import StableDiffusionPipeline, StableDiffusionInpaintPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
@@ -34,12 +41,62 @@ from diffusers.utils.import_utils import is_xformers_available
 import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from animatediff.data.dataset import WebVid10M
+from animatediff.data.anon_dataset_stage1 import GaitLUDatasetImg
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
 from animatediff.utils.util import save_videos_grid, zero_rank_print
+import pickle
+from PIL import Image
 
+def load_pkl_from_folder(pkl_path, sample_size=256, inference_number=16, is_sil=False):
+    if is_sil:
+        img_mode = 'L'
+    else:
+        img_mode = 'RGB'
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
+    return_images = [ Image.fromarray(tmp).convert(img_mode).resize((sample_size, sample_size)) for tmp in data]
+    if len(return_images) < inference_number:
+        return_images = return_images + [return_images[-1]] * (inference_number - len(return_images))
+    else:
+        return_images = return_images[:inference_number]
+    return return_images
 
+def load_images_from_folder(folder, sample_size=256, inference_number=16, is_sil=False):
+    images = []
+    valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"}  # Add or remove extensions as needed
+
+    # Function to extract frame number from the filename
+    # def frame_number(filename):
+    #     parts = filename.split('_')
+    #     if len(parts) > 1 and parts[0] == 'frame':
+    #         try:
+    #             return int(parts[1].split('.')[0])  # Extracting the number part
+    #         except ValueError:
+    #             return float('inf')  # In case of non-integer part, place this file at the end
+    #     return float('inf')  # Non-frame files are placed at the end
+
+    # Sorting files based on frame number
+
+    if is_sil:
+        img_mode = 'L'
+    else:
+        img_mode = 'RGB'
+
+    sorted_files = sorted(os.listdir(folder))
+
+    # Load images in sorted order
+    for filename in sorted_files:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in valid_extensions:
+            img = Image.open(os.path.join(folder, filename)).convert(img_mode).resize((sample_size, sample_size))
+            images.append(img)
+
+    if len(images) < inference_number:
+        images = images + [images[-1]] * (inference_number - len(images))
+    else:
+        images = images[:inference_number]
+    return images
 
 def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     """Initializes distributed environment."""
@@ -72,7 +129,10 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     
     return local_rank
 
-
+def save_pipeline_checkpoint(pipeline, output_dir):
+    save_path = os.path.join(output_dir, "pipeline")
+    os.makedirs(save_path, exist_ok=True)
+    pipeline.save_pretrained(save_path)
 
 def main(
     image_finetune: bool,
@@ -86,6 +146,7 @@ def main(
 
     train_data: Dict,
     validation_data: Dict,
+    is_v100: bool = False,
     cfg_random_null_text: bool = True,
     cfg_random_null_text_ratio: float = 0.1,
     
@@ -122,6 +183,10 @@ def main(
 
     global_seed: int = 42,
     is_debug: bool = False,
+    rank: int = 4,
+
+    use_8bit_adam: bool = True,
+
 ):
     check_min_version("0.10.0.dev0")
 
@@ -172,18 +237,8 @@ def main(
             unet_additional_kwargs=OmegaConf.to_container(unet_additional_kwargs)
         )
     else:
-        unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
+        unet = UNet2DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet_inpaint")
         
-    # Load pretrained unet weights
-    if unet_checkpoint_path != "":
-        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
-        unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
-        if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
-        state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
-
-        m, u = unet.load_state_dict(state_dict, strict=False)
-        zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
-        assert len(u) == 0
         
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -191,15 +246,50 @@ def main(
     
     # Set unet trainable parameters
     unet.requires_grad_(False)
-    for name, param in unet.named_parameters():
-        for trainable_module_name in trainable_modules:
-            if trainable_module_name in name:
-                param.requires_grad = True
-                break
+
+    unet_lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    )
+
+    unet.add_adapter(unet_lora_config)
+
+
+    # Load pretrained unet weights
+    if unet_checkpoint_path != "":
+        zero_rank_print(f"from checkpoint: {unet_checkpoint_path}")
+        unet_checkpoint_path = torch.load(unet_checkpoint_path, map_location="cpu")
+        if "global_step" in unet_checkpoint_path: zero_rank_print(f"global_step: {unet_checkpoint_path['global_step']}")
+        state_dict = unet_checkpoint_path["state_dict"] if "state_dict" in unet_checkpoint_path else unet_checkpoint_path
+
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            tmp_split = key.split(".")
+            new_key = ".".join(tmp_split[1:])
+            new_state_dict[new_key] = value
+
+        m, u = unet.load_state_dict(new_state_dict, strict=True)
+        zero_rank_print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+        assert len(u) == 0
+
+    # for name, param in unet.named_parameters():
+    #     for trainable_module_name in trainable_modules:
+    #         if trainable_module_name in name:
+    #             param.requires_grad = True
+    #             break
             
-    trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    optimizer = torch.optim.AdamW(
-        trainable_params,
+    trainable_params = filter(lambda p: p.requires_grad, unet.parameters())
+    trainable_params_list = list(trainable_params)
+
+    if use_8bit_adam:
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
+        trainable_params_list,
         lr=learning_rate,
         betas=(adam_beta1, adam_beta2),
         weight_decay=adam_weight_decay,
@@ -207,8 +297,8 @@ def main(
     )
 
     if is_main_process:
-        zero_rank_print(f"trainable params number: {len(trainable_params)}")
-        zero_rank_print(f"trainable params scale: {sum(p.numel() for p in trainable_params) / 1e6:.3f} M")
+        zero_rank_print(f"trainable params number: {len(trainable_params_list)}")
+        zero_rank_print(f"trainable params scale: {sum(p.numel() for p in trainable_params_list) / 1e6:.3f} M")
 
     # Enable xformers
     if enable_xformers_memory_efficient_attention:
@@ -226,7 +316,7 @@ def main(
     text_encoder.to(local_rank)
 
     # Get the training dataset
-    train_dataset = WebVid10M(**train_data, is_image=image_finetune)
+    train_dataset = GaitLUDatasetImg(**train_data)
     distributed_sampler = DistributedSampler(
         train_dataset,
         num_replicas=num_processes,
@@ -271,12 +361,13 @@ def main(
         validation_pipeline = AnimationPipeline(
             unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler,
         ).to("cuda")
+        validation_pipeline.enable_vae_slicing()
     else:
-        validation_pipeline = StableDiffusionPipeline.from_pretrained(
+        validation_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
             pretrained_model_path,
             unet=unet, vae=vae, tokenizer=tokenizer, text_encoder=text_encoder, scheduler=noise_scheduler, safety_checker=None,
         )
-    validation_pipeline.enable_vae_slicing()
+        validation_pipeline.vae.enable_slicing()
 
     # DDP warpper
     unet.to(local_rank)
@@ -319,20 +410,33 @@ def main(
             # Data batch sanity check
             if epoch == first_epoch and step == 0:
                 pixel_values, texts = batch['pixel_values'].cpu(), batch['text']
+                mask_values, fg_values = batch["sil_pixel_values"].cpu(), batch["fg_pixel_values"].cpu()
                 if not image_finetune:
                     pixel_values = rearrange(pixel_values, "b f c h w -> b c f h w")
-                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                    mask_values = rearrange(mask_values, "b f c h w -> b c f h w")
+                    fg_values = rearrange(fg_values, "b f c h w -> b c f h w")
+                    for idx, (pixel_value, text, mask_value, fg_value) in enumerate(zip(pixel_values, texts, mask_values, fg_values)):
                         pixel_value = pixel_value[None, ...]
-                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.gif", rescale=True)
-                else:
-                    for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
+                        mask_value = mask_value[None, ...]
+                        fg_value = fg_value[None, ...]
+                        save_videos_grid(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}_rgb.gif", rescale=True)
+                        save_videos_grid(mask_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}_mask.gif", rescale=False)
+                        save_videos_grid(fg_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}_fg.gif", rescale=True)
+                else:   
+                    for idx, (pixel_value, text, mask_value, fg_value) in enumerate(zip(pixel_values, texts, mask_values, fg_values)):
                         pixel_value = pixel_value / 2. + 0.5
-                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}.png")
+                        fg_value = fg_value / 2. + 0.5
+                        torchvision.utils.save_image(pixel_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}_rgb.png")
+                        torchvision.utils.save_image(mask_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}_mask.png")
+                        torchvision.utils.save_image(fg_value, f"{output_dir}/sanity_check/{'-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_rank}-{idx}'}_fg.png")
                     
             ### >>>> Training >>>> ###
             
             # Convert videos to latent space            
             pixel_values = batch["pixel_values"].to(local_rank)
+            fg_values = batch["fg_pixel_values"].to(local_rank)
+            mask_values = batch["sil_pixel_values"].to(local_rank)
+
             video_length = pixel_values.shape[1]
             with torch.no_grad():
                 if not image_finetune:
@@ -340,11 +444,32 @@ def main(
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
                     latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
+
+                    fg_values = rearrange(fg_values, "b f c h w -> (b f) c h w")
+                    fg_latents = vae.encode(fg_values).latent_dist
+                    fg_latents = fg_latents.sample()
+                    fg_latents = rearrange(fg_latents, "(b f) c h w -> b c f h w", f=video_length)
+
+                    mask_values = rearrange(mask_values, "b f c h w -> (b f) c h w")
+                    h, w = mask_values.shape[-2:]
+                    h, w = (x - x % 8 for x in (h, w))  # resize to integer multiple of 8
+                    scale_factor = 8
+                    mask_latents = F.interpolate(mask_values, (h // scale_factor, w // scale_factor))
+                    mask_latents = rearrange(mask_latents, "(b f) c h w -> b c f h w", f=video_length)
                 else:
                     latents = vae.encode(pixel_values).latent_dist
                     latents = latents.sample()
 
+                    fg_latents = vae.encode(fg_values).latent_dist
+                    fg_latents = fg_latents.sample()
+
+                    h, w = mask_values.shape[-2:]
+                    h, w = (x - x % 8 for x in (h, w))  # resize to integer multiple of 8
+                    scale_factor = 8
+                    mask_latents = F.interpolate(mask_values, (h // scale_factor, w // scale_factor))
+
                 latents = latents * 0.18215
+                fg_latents = fg_latents * 0.18215
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -373,10 +498,13 @@ def main(
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+
+            input_latents = torch.cat([noisy_latents, mask_latents, fg_latents], dim=1) # (b, c=4+1+4, f=0 for image, h, w)
+
             # Predict the noise residual and compute loss
             # Mixed-precision training
             with torch.cuda.amp.autocast(enabled=mixed_precision_training):
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = unet(input_latents, timesteps, encoder_hidden_states).sample
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             optimizer.zero_grad()
@@ -386,14 +514,14 @@ def main(
                 scaler.scale(loss).backward()
                 """ >>> gradient clipping >>> """
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
                 """ <<< gradient clipping <<< """
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 """ >>> gradient clipping >>> """
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
                 """ <<< gradient clipping <<< """
                 optimizer.step()
 
@@ -413,7 +541,7 @@ def main(
                 state_dict = {
                     "epoch": epoch,
                     "global_step": global_step,
-                    "state_dict": unet.state_dict(),
+                    "state_dict": unet.state_dict()
                 }
                 if step == len(train_dataloader) - 1:
                     torch.save(state_dict, os.path.join(save_path, f"checkpoint-epoch-{epoch+1}.ckpt"))
@@ -431,7 +559,20 @@ def main(
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
                 width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
 
-                prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
+                prompts = validation_data.prompts
+
+                if not image_finetune:
+                    inference_number = 16
+                else:
+                    inference_number = 1
+
+                val_mask_values = load_images_from_folder(validation_data.mask_path, sample_size=train_data.sample_size, inference_number=inference_number, is_sil=True)
+                val_image_values = load_images_from_folder(validation_data.image_path, sample_size=train_data.sample_size, inference_number=inference_number, is_sil=False)
+
+
+                if not image_finetune:
+                    validation_data["image"] = val_image_values
+                    validation_data["mask_image"] = val_mask_values
 
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
@@ -454,8 +595,12 @@ def main(
                             width               = width,
                             num_inference_steps = validation_data.get("num_inference_steps", 25),
                             guidance_scale      = validation_data.get("guidance_scale", 8.),
+                            mask_image          = val_mask_values[0],
+                            image               = val_image_values[0],
                         ).images[0]
                         sample = torchvision.transforms.functional.to_tensor(sample)
+                        mask_sample = torchvision.transforms.functional.to_tensor(val_mask_values[0]).repeat(3, 1, 1)
+                        sample = torch.cat([sample, mask_sample], dim=-1) # C H 2W
                         samples.append(sample)
                 
                 if not image_finetune:
@@ -474,6 +619,8 @@ def main(
             progress_bar.set_postfix(**logs)
             
             if global_step >= max_train_steps:
+                if is_main_process:
+                    save_pipeline_checkpoint(validation_pipeline, output_dir)
                 break
             
     dist.destroy_process_group()
@@ -485,9 +632,11 @@ if __name__ == "__main__":
     parser.add_argument("--config",   type=str, required=True)
     parser.add_argument("--launcher", type=str, choices=["pytorch", "slurm"], default="pytorch")
     parser.add_argument("--wandb",    action="store_true")
+    parser.add_argument("--use_8bit_adam", action="store_true")
+
     args = parser.parse_args()
 
     name   = Path(args.config).stem
     config = OmegaConf.load(args.config)
 
-    main(name=name, launcher=args.launcher, use_wandb=args.wandb, **config)
+    main(name=name, launcher=args.launcher, use_wandb=args.wandb, use_8bit_adam=args.use_8bit_adam, **config)

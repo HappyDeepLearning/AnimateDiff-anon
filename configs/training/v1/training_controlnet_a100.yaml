@@ -4,6 +4,10 @@ image_finetune: false
 
 output_dir: "outputs"
 pretrained_model_path: "huggingface_models/runwayml/stable-diffusion-v1-5"
+pretrained_controlnet_path: "huggingface_models/lllyasviel/control_v11p_sd15_openpose"
+pre_trained_2d_unet_path: "outputs/cse_output/v100/stage1/checkpoint-epoch-45-res512.ckpt"
+pre_trained_2d_controlnet_path: "outputs/image_finetune_inpaint_controlnet_a100-2024-04-11T19-42-52/checkpoints/checkpoint-epoch-10.ckpt"
+motion_module_path: "huggingface_models/v3_sd15_mm.ckpt"
 
 unet_additional_kwargs:
   use_motion_module              : true
@@ -21,28 +25,28 @@ unet_additional_kwargs:
     temporal_attention_dim_div         : 1
     zero_initialize                    : true
 
+
 noise_scheduler_kwargs:
   num_train_timesteps: 1000
   beta_start:          0.00085
   beta_end:            0.012
-  beta_schedule:       "linear" # `linear`, `scaled_linear`, or `squaredcos_cap_v2`
+  beta_schedule:       "linear"
   steps_offset:        1
-  clip_sample:         False
+  clip_sample:         false
 
 train_data:
-  rgb_root: dataset/train_data/GaitLU_pkl/train/org
-  pose_root: dataset/train_data/GaitLU_pkl/train/pose
-  sil_root: dataset/train_data/GaitLU_pkl/train/sil
-  sample_size: 256
-  frame_number: 16
+  rgb_root: dataset/train_data/train/org
+  pose_root: dataset/train_data/train/pose
+  sil_root: dataset/train_data/train/sil
+  sample_size: 512
+  frame_number: 3
   interval: 4
   text_prompts:
     - "passerby"
-    - "neature passerby"
+    - "realistic passerby"
     - "a video of passerby"
     - "a video of a pedestrian"
     - "a video of a person walking"
-    - "a video of a person walking in the street"
     - "person"
     - "person walking"
     - "pedestrian"
@@ -50,23 +54,27 @@ train_data:
 validation_data:
   prompts:
     - "person with thinness and high height, best quality, realistic"
-  mask_path: dataset/train_data/GaitLU_pkl/test/sil/Delhi/000051.pkl
-  image_path: dataset/train_data/GaitLU_pkl/test/org/Delhi/000051.pkl
+  mask_path: dataset/train_data/test/sil/Delhi/000051.pkl
+  image_path: dataset/train_data/test/org/Delhi/000051.pkl
+  pose_path: dataset/train_data/test/pose/Delhi/000051.pkl
   num_inference_steps: 25
   guidance_scale: 8.
-  deliate_mask: False
+  context_overlap: 1
 
-trainable_modules:
+
+trainable_modules: 
   - "motion_modules."
+  # - "attn_temp"
+  # - "norm_temp"
 
 unet_checkpoint_path: ""
 
 learning_rate:    1.e-5
-train_batch_size: 2
+train_batch_size: 1
 
-max_train_epoch:      20
+max_train_epoch:      10
 max_train_steps:      -1
-checkpointing_epochs: 1
+checkpointing_epochs: 5
 checkpointing_steps:  -1
 
 validation_steps:       2000
@@ -80,8 +88,6 @@ is_debug: False
 
 rank: 4
 
-pre_trained_2d_unet_path: "outputs/cse_output/v100/stage1/checkpoint-epoch-49.ckpt"
+inference_frame_number: 8
 
-inference_frame_number: 32
-motion_module_path: huggingface_models/v3_sd15_mm.ckpt
-mm_zero_proj_out: False
+mm_zero_proj_out: false

@@ -1,0 +1,64 @@
+is_v100: false
+
+image_finetune: true
+
+output_dir: "outputs"
+pretrained_model_path: "huggingface_models/runwayml/stable-diffusion-v1-5"
+pretrained_controlnet_path: "huggingface_models/lllyasviel/control_v11p_sd15_openpose"
+pre_trained_2d_unet_path: "outputs/cse_output/v100/stage1/checkpoint-epoch-45-res512.ckpt"
+# pre_trained_2d_controlnet_path: "outputs/image_finetune_inpaint_controlnet-2024-04-11T00-19-42/checkpoints/checkpoint-epoch-2.ckpt"
+
+noise_scheduler_kwargs:
+  num_train_timesteps: 1000
+  beta_start:          0.00085
+  beta_end:            0.012
+  beta_schedule:       "scaled_linear"
+  steps_offset:        1
+  clip_sample:         false
+
+train_data:
+  rgb_root: dataset/train_data/GaitLU_pkl/train/org
+  pose_root: dataset/train_data/GaitLU_pkl/train/pose
+  sil_root: dataset/train_data/GaitLU_pkl/train/sil
+  sample_size: 512
+  text_prompts:
+    - "passerby"
+    - "realistic passerby"
+    - "a image of passerby"
+    - "a image of a pedestrian"
+    - "a image of a person walking"
+    - "person"
+    - "person walking"
+    - "pedestrian"
+
+
+validation_data:
+  prompts:
+    - "(person, full body), best quality, highres"
+  mask_path: dataset/train_data/GaitLU_pkl/test/sil/Delhi/000051.pkl
+  image_path: dataset/train_data/GaitLU_pkl/test/org/Delhi/000051.pkl
+  pose_path: dataset/train_data/GaitLU_pkl/test/pose/Delhi/000051.pkl
+  num_inference_steps: 25
+  guidance_scale: 8.
+
+trainable_modules:
+  - "."
+
+unet_checkpoint_path: ""
+
+learning_rate:    1.e-5
+train_batch_size: 8
+
+max_train_epoch:      8
+max_train_steps:      -1
+checkpointing_epochs: 1
+checkpointing_steps:  -1
+
+validation_steps:       500
+validation_steps_tuple: [2, 500]
+
+global_seed: 347
+mixed_precision_training: False
+enable_xformers_memory_efficient_attention: False
+
+is_debug: False

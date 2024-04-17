@@ -1,0 +1,103 @@
+is_v100: false
+
+image_finetune: false
+
+output_dir: "outputs"
+pretrained_model_path: "huggingface_models/runwayml/stable-diffusion-v1-5"
+
+unet_additional_kwargs:
+  use_motion_module              : true
+  motion_module_resolutions      : [ 1,2,4,8 ]
+  unet_use_cross_frame_attention : False
+  unet_use_temporal_attention    : false
+
+  motion_module_type: Vanilla
+  motion_module_kwargs:
+    num_attention_heads                : 8
+    num_transformer_block              : 1
+    attention_block_types              : [ "Temporal_Self", "Temporal_Self" ]
+    temporal_position_encoding         : true
+    temporal_position_encoding_max_len : 24
+    temporal_attention_dim_div         : 1
+    zero_initialize                    : true
+
+noise_scheduler_kwargs:
+  num_train_timesteps: 1000
+  beta_start:          0.00085
+  beta_end:            0.012
+  beta_schedule:       "linear" # `linear`, `scaled_linear`, or `squaredcos_cap_v2`
+  steps_offset:        1
+  clip_sample:         False
+
+train_data:
+  data_root: dataset/train_data/GaitLU_img # 4GPUs
+  # data_root: dataset/GaitLU_img # A100
+  is_train: true
+  train_test_ratio: 0.85 
+  sample_size: 256 # <------------------------这里更改分辨率
+  frame_number: 16 # <------------------------这里更改训练的帧数
+  interval: 4
+  text_prompts:
+    prob_each_parts: [0.3, 0.2, 1.0, 0.5, 0.1]
+    base_text:
+      - "an video of"
+      - "an video of a"
+      - "a"
+    adj_text:
+      - "realistic"
+      - "natural"
+      - "high quality"
+    n_text:
+      - "person"
+      - "pedestrian"
+      - "passerby"
+      - "human"
+    v_text:
+      - "is walking"
+      - "is runing"
+      - "is strolling"
+      - "is moving"
+    adv_text:
+      - "on the street"
+      - "along the sidewalk"
+
+validation_data:
+  prompts:
+    - "a person is walking, best quality, realistic"
+  image_path: dataset/train_data/GaitLU_img/test/org/Delhi/000051 # 4GPUs
+  mask_path: dataset/train_data/GaitLU_img/test/sil/Delhi/000051 # 4GPUs
+  # image_path: dataset/GaitLU_img/test/org/Delhi/000051 # A100
+  # mask_path: dataset/GaitLU_img/test/sil/Delhi/000051 # A100
+  num_inference_steps: 25
+  guidance_scale: 8.
+  deliate_mask: False
+
+trainable_modules:
+  - "motion_modules."
+
+unet_checkpoint_path: ""
+
+learning_rate:    1.e-5
+train_batch_size: 2
+
+max_train_epoch:      20 # <------------------------这里更改训练的epoch数
+max_train_steps:      -1
+checkpointing_epochs: 1 # <------------------------这里更改checkpoint的epoch数
+checkpointing_steps:  -1
+
+validation_steps:       2000
+validation_steps_tuple: [1, 500]
+
+global_seed: 347
+mixed_precision_training: true
+enable_xformers_memory_efficient_attention: False
+
+is_debug: False
+
+rank: 4
+
+pre_trained_2d_unet_path: "outputs/stage1_image_finetune_inpaint-2024-04-15T23-32-07/checkpoints/checkpoint-epoch-2.ckpt" # <------------------------这里记得加入第一阶段预训练的模型路径
+
+inference_frame_number: 32 # <------------------------这里更改inference的帧数
+# motion_module_path: huggingface_models/v3_sd15_mm.ckpt
+# mm_zero_proj_out: False

@@ -9,7 +9,9 @@ import datetime
 import subprocess
 
 from pathlib import Path
+# import bitsandbytes as bnb
 from tqdm.auto import tqdm
+
 from einops import rearrange
 from omegaconf import OmegaConf
 from safetensors import safe_open
@@ -23,7 +25,7 @@ from torch.optim.swa_utils import AveragedModel
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# import diffusers
+import diffusers
 from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.models import UNet2DConditionModel
 from diffusers.pipelines import StableDiffusionPipeline
@@ -34,7 +36,7 @@ from diffusers.utils.import_utils import is_xformers_available
 import transformers
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from animatediff.data.dataset import WebVid10M
+from animatediff.data.anon_dataset import GaitLUDatasetPKL, GaitLUDatasetImg
 from animatediff.models.unet import UNet3DConditionModel
 from animatediff.pipelines.pipeline_animation import AnimationPipeline
 from animatediff.utils.util import save_videos_grid, zero_rank_print
@@ -72,7 +74,10 @@ def init_dist(launcher="slurm", backend='nccl', port=29500, **kwargs):
     
     return local_rank
 
-
+def save_pipeline_checkpoint(pipeline, output_dir):
+    save_path = os.path.join(output_dir, "pipeline")
+    os.makedirs(save_path, exist_ok=True)
+    pipeline.save_pretrained(save_path)
 
 def main(
     image_finetune: bool,
@@ -86,6 +91,7 @@ def main(
 
     train_data: Dict,
     validation_data: Dict,
+    is_v100: bool = False,
     cfg_random_null_text: bool = True,
     cfg_random_null_text_ratio: float = 0.1,
     
@@ -198,7 +204,11 @@ def main(
                 break
             
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    optimizer = torch.optim.AdamW(
+
+    # optimizer_cls = bnb.optim.AdamW8bit
+    optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
         trainable_params,
         lr=learning_rate,
         betas=(adam_beta1, adam_beta2),
@@ -226,7 +236,10 @@ def main(
     text_encoder.to(local_rank)
 
     # Get the training dataset
-    train_dataset = WebVid10M(**train_data, is_image=image_finetune)
+    if is_v100:
+        train_dataset = GaitLUDatasetImg(**train_data, image_finetune=image_finetune)
+    else:
+        train_dataset = GaitLUDatasetPKL(**train_data, image_finetune=image_finetune)
     distributed_sampler = DistributedSampler(
         train_dataset,
         num_replicas=num_processes,
@@ -431,7 +444,7 @@ def main(
                 height = train_data.sample_size[0] if not isinstance(train_data.sample_size, int) else train_data.sample_size
                 width  = train_data.sample_size[1] if not isinstance(train_data.sample_size, int) else train_data.sample_size
 
-                prompts = validation_data.prompts[:2] if global_step < 1000 and (not image_finetune) else validation_data.prompts
+                prompts = validation_data.prompts
 
                 for idx, prompt in enumerate(prompts):
                     if not image_finetune:
@@ -474,6 +487,8 @@ def main(
             progress_bar.set_postfix(**logs)
             
             if global_step >= max_train_steps:
+                if is_main_process:
+                    save_pipeline_checkpoint(validation_pipeline, output_dir)
                 break
             
     dist.destroy_process_group()
@@ -485,6 +500,7 @@ if __name__ == "__main__":
     parser.add_argument("--config",   type=str, required=True)
     parser.add_argument("--launcher", type=str, choices=["pytorch", "slurm"], default="pytorch")
     parser.add_argument("--wandb",    action="store_true")
+
     args = parser.parse_args()
 
     name   = Path(args.config).stem

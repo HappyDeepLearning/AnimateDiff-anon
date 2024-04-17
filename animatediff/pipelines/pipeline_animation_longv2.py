@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import math
 from tqdm import tqdm
+import random
 
 from diffusers.utils import is_accelerate_available
 from packaging import version
@@ -14,6 +16,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models import AutoencoderKL
+from diffusers.loaders import LoraLoaderMixin
 from diffusers.pipelines import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint import retrieve_latents
 from diffusers.schedulers import (
@@ -28,10 +31,14 @@ from diffusers.utils import deprecate, logging, BaseOutput
 from diffusers.image_processor import VaeImageProcessor
 
 from einops import rearrange
+from kornia import morphology as morph
 
 from ..models.unet import UNet3DConditionModel
-from ..models.sparse_controlnet import SparseTemporalControlNetModel
-import pdb
+from ..models.controlnet2d import ControlNetModel
+# from ..models.sparse_controlnet import SparseTemporalControlNetModel
+from .utils import get_tensor_interpolation_method, set_tensor_interpolation_method
+from .context import get_context_scheduler
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -41,7 +48,7 @@ class AnimationPipelineOutput(BaseOutput):
     videos: Union[torch.Tensor, np.ndarray]
 
 
-class AnimationPipeline(DiffusionPipeline):
+class AnimationPipeline(DiffusionPipeline, LoraLoaderMixin):
     _optional_components = []
 
     def __init__(
@@ -58,7 +65,7 @@ class AnimationPipeline(DiffusionPipeline):
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
         ],
-        controlnet: Union[SparseTemporalControlNetModel, None] = None,
+        controlnet: Union[ControlNetModel, None] = None,
     ):
         super().__init__()
 
@@ -123,6 +130,10 @@ class AnimationPipeline(DiffusionPipeline):
         self.mask_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
+        self.control_image_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
+        )
+        set_tensor_interpolation_method(False)
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -245,20 +256,38 @@ class AnimationPipeline(DiffusionPipeline):
 
         return text_embeddings
 
-    def decode_latents(self, latents):
+    def decode_latents(self, latents, decoder_consistency=None):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
         # video = self.vae.decode(latents).sample
         video = []
         for frame_idx in tqdm(range(latents.shape[0])):
-            video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
+            if decoder_consistency is not None:
+                video.append(decoder_consistency(latents[frame_idx:frame_idx+1]))
+            else:
+                video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
         video = torch.cat(video)
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         video = video.cpu().float().numpy()
         return video
+
+    # def decode_latents(self, latents):
+    #     video_length = latents.shape[2]
+    #     latents = 1 / 0.18215 * latents
+    #     latents = rearrange(latents, "b c f h w -> (b f) c h w")
+    #     # video = self.vae.decode(latents).sample
+    #     video = []
+    #     for frame_idx in tqdm(range(latents.shape[0])):
+    #         video.append(self.vae.decode(latents[frame_idx:frame_idx+1]).sample)
+    #     video = torch.cat(video)
+    #     video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
+    #     video = (video / 2 + 0.5).clamp(0, 1)
+    #     # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+    #     video = video.cpu().float().numpy()
+    #     return video
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -292,13 +321,23 @@ class AnimationPipeline(DiffusionPipeline):
                 f" {type(callback_steps)}."
             )
 
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None):
+    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator, latents=None, return_image_latents=False):
         shape = (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
+
+        # if return_image_latents or (latents is None):
+        #     image = image.to(device=device, dtype=dtype)
+
+        #     if image.shape[1] == 4:
+        #         image_latents = image
+        #     else:
+        #         image_latents = self._encode_vae_image(image=image, generator=generator)
+        #     image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
+
         if latents is None:
             rand_device = "cpu" if device.type == "mps" else device
 
@@ -318,7 +357,10 @@ class AnimationPipeline(DiffusionPipeline):
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
+
         latents = latents * self.scheduler.init_noise_sigma
+        # if return_image_latents:
+        #     return [latents, image_latents]
         return latents
 
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
@@ -336,14 +378,23 @@ class AnimationPipeline(DiffusionPipeline):
         return image_latents
 
     def prepare_mask_latents(
-        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance, inference_frame_number
+        self, mask, init_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance, inference_frame_number, deliate_mask
     ):
         # resize the mask to latents shape as we concatenate the mask to the latents
         # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
         # and half precision
 
         mask = rearrange(mask, "b c f h w -> (b f) c h w").contiguous()
-        masked_image = rearrange(masked_image, "b c f h w -> (b f) c h w").contiguous()
+        init_image = rearrange(init_image, "b c f h w -> (b f) c h w").contiguous()
+
+
+        if deliate_mask:
+            kernel_size = random.randint(3,10)
+            kernel = torch.ones((kernel_size, kernel_size))
+            print(f"dilation mask with kernel size {kernel_size}")
+            mask = morph.dilation(mask, kernel.to(mask.device))
+
+        masked_image = init_image * (mask < 0.5)
 
         mask = torch.nn.functional.interpolate(mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor))
         mask = mask.to(device=device, dtype=dtype)
@@ -385,6 +436,40 @@ class AnimationPipeline(DiffusionPipeline):
         masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
         return mask, masked_image_latents
 
+    def interpolate_latents(self, latents: torch.Tensor, interpolation_factor:int, device ):
+        if interpolation_factor < 2:
+            return latents
+
+        new_latents = torch.zeros(
+                    (latents.shape[0],latents.shape[1],((latents.shape[2]-1) * interpolation_factor)+1, latents.shape[3],latents.shape[4]),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+
+        org_video_length = latents.shape[2]
+        rate = [i/interpolation_factor for i in range(interpolation_factor)][1:]
+
+        new_index = 0
+
+        v0 = None
+        v1 = None
+
+        for i0,i1 in zip( range( org_video_length ),range( org_video_length )[1:] ):
+            v0 = latents[:,:,i0,:,:]
+            v1 = latents[:,:,i1,:,:]
+
+            new_latents[:,:,new_index,:,:] = v0
+            new_index += 1
+
+            for f in rate:
+                v = get_tensor_interpolation_method()(v0.to(device=device),v1.to(device=device),f)
+                new_latents[:,:,new_index,:,:] = v.to(latents.device)
+                new_index += 1
+
+        new_latents[:,:,new_index,:,:] = v1
+        new_index += 1
+
+        return new_latents
 
     @torch.no_grad()
     def __call__(
@@ -406,16 +491,23 @@ class AnimationPipeline(DiffusionPipeline):
         callback_steps: Optional[int] = 1,
 
         # support controlnet
-        controlnet_images: torch.FloatTensor = None,
-        controlnet_image_index: list = [0],
-        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+        control_image = None,
+        controlnet_conditioning_scale: Union[float, List[float]] = 0.5,
 
         # support inpainting
         mask_image   = None,
         image        = None,
+        deliate_mask= False,
 
         # long video support
-        overlap=2,
+        context_schedule="uniform",
+        context_frames=24,
+        context_stride=3,
+        context_overlap=4,
+        context_batch_size=1,
+        interpolation_factor=1,
+        decoder_consistency=None,
+        return_image_latents=False,
 
         **kwargs,
     ):
@@ -452,28 +544,43 @@ class AnimationPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
+
         init_image = self.image_processor.preprocess(
             image, height=height, width=width, crops_coords=None, resize_mode="default"
         )
-        init_image = init_image.to(dtype=torch.float32)
+        init_image = init_image.to(dtype=text_embeddings.dtype)
         inference_frame_number = len(init_image)
 
         init_image = init_image.squeeze(0).repeat(batch_size, 1, 1, 1, 1) # [B, T, C, H, W]
         init_image = rearrange(init_image, "b t c h w -> b c t h w")
 
+        if control_image is not None:
+            control_image = self.control_image_processor.preprocess(
+                control_image, height=height, width=width, crops_coords=None, resize_mode="default"
+            ).to(dtype=text_embeddings.dtype)
+            control_image = control_image.squeeze(0).repeat(batch_size, 1, 1, 1, 1) # [B, T, C, H, W]
+            control_image = rearrange(control_image, "b t c h w -> b c t h w").contiguous()
+            control_image = torch.cat([control_image] * 2) if do_classifier_free_guidance else control_image
+
         # Prepare latent variables
         num_channels_latents = 4
-        latents = self.prepare_latents(
+        latents_output = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
-            inference_frame_number,
+            video_length,
             height,
             width,
             text_embeddings.dtype,
             device,
             generator,
             latents,
+            return_image_latents=return_image_latents
         )
+        if return_image_latents:
+            latents, image_latents = latents_output
+        else:
+            latents = latents_output
+        
         latents_dtype = latents.dtype
 
         # Prepare mask latent variables
@@ -484,11 +591,10 @@ class AnimationPipeline(DiffusionPipeline):
         mask_condition = mask_condition.squeeze(0).repeat(batch_size, 1, 1, 1, 1) # [B, T, C, H, W]
         mask_condition = rearrange(mask_condition, "b t c h w -> b c t h w")
 
-        masked_image = init_image * (mask_condition < 0.5)
-
+        
         mask, masked_image_latents = self.prepare_mask_latents(
             mask_condition,
-            masked_image,
+            init_image,
             batch_size * num_videos_per_prompt,
             height,
             width,
@@ -496,90 +602,165 @@ class AnimationPipeline(DiffusionPipeline):
             device,
             generator,
             do_classifier_free_guidance,
-            inference_frame_number=inference_frame_number
+            inference_frame_number=inference_frame_number,
+            deliate_mask=deliate_mask
         )
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        latents_all = latents
-        mask_all = mask
-        masked_image_latents_all = masked_image_latents
+        context_scheduler = get_context_scheduler(context_schedule)
 
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                pred_tmp = torch.zeros_like(latents_all)
-                counter = torch.zeros((latents.shape[0], 1, inference_frame_number, 1, 1 )).to(device=latents.device)
-                for batch, ind_start in enumerate(range(0, inference_frame_number, video_length-overlap)):
-                    self.scheduler._step_index = None
-                    if ind_start + video_length >= inference_frame_number:
-                        ind_start = inference_frame_number - 1 - video_length
-                    latents = latents_all[:,:,ind_start:ind_start+video_length].contiguous()
-                    mask = mask_all[:,:,ind_start:ind_start+video_length].contiguous()
-                    masked_image_latents = masked_image_latents_all[:,:,ind_start:ind_start+video_length].contiguous()
 
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                noise_pred = torch.zeros(
+                    (
+                        latents.shape[0] * (2 if do_classifier_free_guidance else 1),
+                        *latents.shape[1:],
+                    ),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+                counter = torch.zeros(
+                    (1, 1, latents.shape[2], 1, 1),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+
+                # context_queue = list(
+                #     context_scheduler(
+                #         0,
+                #         num_inference_steps,
+                #         latents.shape[2],
+                #         context_frames,
+                #         context_stride,
+                #         0,
+                #     )
+                # )
+                # num_context_batches = math.ceil(len(context_queue) / context_batch_size)
+
+                context_queue = list(
+                    context_scheduler(
+                        0,
+                        num_inference_steps,
+                        latents.shape[2],
+                        context_frames,
+                        context_stride,
+                        context_overlap,
+                    )
+                )
+
+                num_context_batches = math.ceil(len(context_queue) / context_batch_size)
+
+                global_context = []
+
+                for i in range(num_context_batches):
+                    global_context.append(
+                        context_queue[
+                            i * context_batch_size : (i + 1) * context_batch_size
+                        ]
+                    )
+
+                for context in global_context:
+                    latent_model_input = (
+                        torch.cat([latents[:, :, c] for c in context])
+                        .to(device)
+                        .repeat(2 if do_classifier_free_guidance else 1, 1, 1, 1, 1)
+                    )
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                    latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+                    latent_mask = torch.cat([mask[:, :, c] for c in context]).to(device)
+                    latent_masked_image = torch.cat([masked_image_latents[:, :, c] for c in context]).to(device)
+
+                    if control_image is not None:
+                        tmp_controlnet_cond = torch.cat([control_image[:, :, c] for c in context]).to(device)
+                    else:
+                        tmp_controlnet_cond = None
 
                     down_block_additional_residuals = mid_block_additional_residual = None
-                    if (getattr(self, "controlnet", None) != None) and (controlnet_images != None):
-                        assert controlnet_images.dim() == 5
+                    if (getattr(self, "controlnet", None) != None) and (tmp_controlnet_cond != None):
+                        assert tmp_controlnet_cond.dim() == 5
+                        
+                        tmp_controlnet_cond = rearrange(tmp_controlnet_cond, "b c t h w -> (b t) c h w").contiguous()
+                        controlnet_noisy_latents = rearrange(latent_model_input, "b c t h w -> (b t) c h w").contiguous()
+                        controlnet_prompt_embeds = text_embeddings.repeat(context_frames, 1, 1)
 
-                        controlnet_noisy_latents = latent_model_input
-                        controlnet_prompt_embeds = text_embeddings
+                        tmp_controlnet_cond = tmp_controlnet_cond.to(latents.device)
 
-                        controlnet_images = controlnet_images.to(latents.device)
+                        # controlnet_cond_shape[2] = context_frames
+                        # controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
 
-                        controlnet_cond_shape    = list(controlnet_images.shape)
-                        controlnet_cond_shape[2] = video_length
-                        controlnet_cond = torch.zeros(controlnet_cond_shape).to(latents.device)
+                        # controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
+                        # controlnet_conditioning_mask_shape[1] = 1
+                        # controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
 
-                        controlnet_conditioning_mask_shape    = list(controlnet_cond.shape)
-                        controlnet_conditioning_mask_shape[1] = 1
-                        controlnet_conditioning_mask          = torch.zeros(controlnet_conditioning_mask_shape).to(latents.device)
+                        # assert tmp_controlnet_cond.shape[2] >= len(controlnet_image_index)
+                        # controlnet_cond[:,:,controlnet_image_index] = tmp_controlnet_cond[:,:,:len(controlnet_image_index)]
+                        # controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
 
-                        assert controlnet_images.shape[2] >= len(controlnet_image_index)
-                        controlnet_cond[:,:,controlnet_image_index] = controlnet_images[:,:,:len(controlnet_image_index)]
-                        controlnet_conditioning_mask[:,:,controlnet_image_index] = 1
 
                         down_block_additional_residuals, mid_block_additional_residual = self.controlnet(
                             controlnet_noisy_latents, t,
                             encoder_hidden_states=controlnet_prompt_embeds,
-                            controlnet_cond=controlnet_cond,
-                            conditioning_mask=controlnet_conditioning_mask,
+                            controlnet_cond=tmp_controlnet_cond,
+                            # conditioning_mask=controlnet_conditioning_mask,
                             conditioning_scale=controlnet_conditioning_scale,
                             guess_mode=False, return_dict=False,
                         )
 
+                        down_block_additional_residuals = [rearrange(tmp, "(b t) c h w -> b c t h w", t=context_frames).contiguous() for tmp in down_block_additional_residuals]
+                        mid_block_additional_residual = rearrange(mid_block_additional_residual, "(b t) c h w -> b c t h w", t=context_frames).contiguous()
+                    
+                    latent_model_input = torch.cat([latent_model_input, latent_mask, latent_masked_image], dim=1)
                     # predict the noise residual
-                    noise_pred = self.unet(
+                    pred = self.unet(
                         latent_model_input, t, 
-                        encoder_hidden_states=text_embeddings,
+                        encoder_hidden_states=text_embeddings.repeat(len(context), 1, 1),
                         down_block_additional_residuals = down_block_additional_residuals,
                         mid_block_additional_residual   = mid_block_additional_residual,
                     ).sample.to(dtype=latents_dtype)
 
-                    # perform guidance
                     if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                    
-                    if batch == 0:
-                        pred_tmp[:,:,ind_start:ind_start+video_length] += latents
-                        counter[:,:,ind_start:ind_start+video_length] += 1
+                        pred_uc, pred_c = pred.chunk(2)
+                        pred = torch.cat([pred_uc.unsqueeze(0), pred_c.unsqueeze(0)])
+                        for j, c in enumerate(context):
+                            noise_pred[:, :, c] = noise_pred[:, :, c] + pred[:, j]
+                            counter[:, :, c] = counter[:, :, c] + 1
                     else:
-                        pred_tmp[:,:,ind_start+1:ind_start+video_length] += latents[:,:,1:]
-                        counter[:,:,ind_start+1:ind_start+video_length] += 1
-                pred_tmp /= (counter + 1e-6)
-                latents_all = pred_tmp
+                        pred = pred.unsqueeze(0)
+                        for j, c in enumerate(context):
+                            noise_pred[:, :, c] = noise_pred[:, :, c] + pred[:, j]
+                            counter[:, :, c] = counter[:, :, c] + 1
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = (noise_pred / counter).chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+                else:
+                    noise_pred = noise_pred / counter
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                
+                # if return_image_latents:
+                #     init_latents_proper = image_latents
+                #     if self.do_classifier_free_guidance:
+                #         init_mask, _ = mask.chunk(2)
+                #     else:
+                #         init_mask = mask
+
+                #     if i < len(timesteps) - 1:
+                #         noise_timestep = timesteps[i + 1]
+                #         init_latents_proper = self.scheduler.add_noise(
+                #             init_latents_proper, noise, torch.tensor([noise_timestep])
+                #         )
+
+                #     latents = (1 - init_mask) * init_latents_proper + init_mask * latents
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -589,10 +770,11 @@ class AnimationPipeline(DiffusionPipeline):
 
                 # if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                 #     progress_bar.update()
-        latents = latents_all
+        if interpolation_factor > 0:
+            latents = self.interpolate_latents(latents, interpolation_factor, device)
 
         # Post-processing
-        video = self.decode_latents(latents)
+        video = self.decode_latents(latents, decoder_consistency)
 
         # Convert to tensor
         if output_type == "tensor":

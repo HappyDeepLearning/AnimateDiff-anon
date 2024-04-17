@@ -1,0 +1,1 @@
+rsync -avp --exclude="wandb/" --exclude="outputs/" --exclude="dataset"  --exclude="Track-Anything" --exclude="huggingface_models" mjz@172.18.36.144:/data3/mjz/Python_workspace/Anon_diffuser/AnimateDiff-anon ../

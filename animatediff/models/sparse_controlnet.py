@@ -23,7 +23,7 @@ from torch.nn import functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.utils import BaseOutput, logging
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
-from diffusers.modeling_utils import ModelMixin
+from diffusers import ModelMixin
 
 
 from .unet_blocks import (
@@ -35,7 +35,8 @@ from .unet_blocks import (
 from einops import repeat, rearrange
 from .resnet import InflatedConv3d
 
-from diffusers.models.unet_2d_condition import UNet2DConditionModel
+# from diffusers.models.unet_2d_condition import UNet2DConditionModel
+from .unet import UNet3DConditionModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -82,7 +83,7 @@ class SparseControlNetConditioningEmbedding(nn.Module):
         return embedding
 
 
-class SparseControlNetModel(ModelMixin, ConfigMixin):
+class SparseTemporalControlNetModel(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -93,10 +94,10 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
         flip_sin_to_cos: bool = True,
         freq_shift: int = 0,
         down_block_types: Tuple[str] = (
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "DownBlock2D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "DownBlock3D",
         ),
         only_cross_attention: Union[bool, Tuple[bool]] = False,
         block_out_channels: Tuple[int] = (320, 640, 1280, 1280),
@@ -128,12 +129,11 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
             "num_transformer_block": 1,
             "attention_block_types": ["Temporal_Self"],
             "temporal_position_encoding": True,
-            "temporal_position_encoding_max_len": 32,
-            "temporal_attention_dim_div": 1,
-            "causal_temporal_attention": False,
+            "temporal_position_encoding_max_len": 24,
+            "temporal_attention_dim_div": 1
         },
 
-        concate_conditioning_mask: bool = True,
+        concate_conditioning_mask: bool = False,
         use_simplified_condition_embedding:  bool = False,
 
         set_noisy_sample_input_to_zero: bool = False,
@@ -316,7 +316,7 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
     @classmethod
     def from_unet(
         cls,
-        unet: UNet2DConditionModel,
+        unet: UNet3DConditionModel,
         controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = True,
@@ -338,13 +338,11 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
             norm_eps=unet.config.norm_eps,
             cross_attention_dim=unet.config.cross_attention_dim,
             attention_head_dim=unet.config.attention_head_dim,
-            num_attention_heads=unet.config.num_attention_heads,
             use_linear_projection=unet.config.use_linear_projection,
             class_embed_type=unet.config.class_embed_type,
             num_class_embeds=unet.config.num_class_embeds,
             upcast_attention=unet.config.upcast_attention,
             resnet_time_scale_shift=unet.config.resnet_time_scale_shift,
-            projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
             controlnet_conditioning_channel_order=controlnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
 
@@ -374,6 +372,8 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
         new_state_dict = {}
         for name, param in state_dict.items():
             if "motion_modules." in name or "lora" in name: continue
+            if "base_layer." in name:
+                name = name.replace("base_layer.", "")
             new_state_dict[name] = param
         return new_state_dict
 
@@ -444,7 +444,7 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
             fn_recursive_set_attention_slice(module, reversed_slice_size)
 
     def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (CrossAttnDownBlock2D, DownBlock2D)):
+        if isinstance(module, (CrossAttnDownBlock3D, DownBlock3D)):
             module.gradient_checkpointing = value
 
     def forward(
@@ -493,7 +493,7 @@ class SparseControlNetModel(ModelMixin, ConfigMixin):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timesteps = timesteps.expand(sample.shape[0])
 
-        t_emb = self.time_proj(timesteps)
+        t_emb = self.time_proj(timesteps) # [2, 320]
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.

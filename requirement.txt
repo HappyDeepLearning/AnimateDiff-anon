@@ -1,0 +1,16 @@
+diffusers
+transformers
+xformers
+imageio
+decord
+gdown
+einops
+omegaconf
+safetensors
+gradio
+wandb
+accelerate
+natsort
+kornia
+peft
+bitsandbytes

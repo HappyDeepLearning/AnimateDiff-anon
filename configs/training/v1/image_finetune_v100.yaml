@@ -1,4 +1,4 @@
-is_v100: false
+is_v100: true
 
 image_finetune: true
 
@@ -14,9 +14,9 @@ noise_scheduler_kwargs:
   clip_sample:         false
 
 train_data:
-  rgb_root: dataset/train_data/GaitLU_pkl/train/org
-  pose_root: dataset/train_data/GaitLU_pkl/train/pose
-  sil_root: dataset/train_data/GaitLU_pkl/train/sil
+  rgb_root: dataset/train_data/rgb
+  pose_root: dataset/train_data/pose
+  sil_root: dataset/train_data/sil
   sample_size: 256
   text_prompts:
     - "passerby"
@@ -42,14 +42,14 @@ trainable_modules:
 unet_checkpoint_path: ""
 
 learning_rate:    1.e-5
-train_batch_size: 4
+train_batch_size: 8
 
-max_train_epoch:      -1
-max_train_steps:      10
+max_train_epoch:      20
+max_train_steps:      -1
 checkpointing_epochs: -1
-checkpointing_steps:  5
+checkpointing_steps:  5000
 
-validation_steps:       5
+validation_steps:       500
 validation_steps_tuple: [2, 500]
 
 global_seed: 347
